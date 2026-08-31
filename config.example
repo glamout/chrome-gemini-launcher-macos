@@ -1,0 +1,15 @@
+# Chrome Gemini Launcher configuration
+# Copy to ~/.config/chrome-gemini/config and edit as needed.
+
+# ISO 3166-1 alpha-2 country code passed to Chrome.
+REGION=us
+
+# Leave empty to use the macOS system proxy. Set any supported HTTP/SOCKS URL.
+PROXY_SERVER=
+
+# warn: warn when a local proxy is unavailable; strict: stop; off: skip check.
+PROXY_CHECK=warn
+
+# Standard Chrome installation defaults.
+CHROME_APP=/Applications/Google Chrome.app
+CHROME_PROCESS=Google Chrome

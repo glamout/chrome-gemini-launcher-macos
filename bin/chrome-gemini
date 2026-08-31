@@ -1,0 +1,449 @@
+#!/bin/bash
+
+set -euo pipefail
+
+VERSION="1.1.0"
+PROGRAM_NAME="chrome-gemini"
+
+REGION="us"
+PROXY_SERVER=""
+PROXY_CHECK="warn"
+CHROME_APP="/Applications/Google Chrome.app"
+CHROME_PROCESS="Google Chrome"
+PROXY_STATUS="unchecked"
+
+CONFIG_FILE="${CHROME_GEMINI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/chrome-gemini/config}"
+LOCAL_STATE="${CHROME_GEMINI_LOCAL_STATE:-$HOME/Library/Application Support/Google/Chrome/Local State}"
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+unquote() {
+    local value="$1"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    printf '%s' "$value"
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(trim "$line")
+        [ -z "$line" ] && continue
+        [[ "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || continue
+
+        key=$(trim "${line%%=*}")
+        value=$(trim "${line#*=}")
+        value=$(unquote "$value")
+
+        case "$key" in
+            REGION) REGION="$value" ;;
+            PROXY_SERVER) PROXY_SERVER="$value" ;;
+            PROXY_CHECK) PROXY_CHECK="$value" ;;
+            CHROME_APP) CHROME_APP="$value" ;;
+            CHROME_PROCESS) CHROME_PROCESS="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+validate_config() {
+    if [[ ! "$REGION" =~ ^[A-Za-z]{2}$ ]]; then
+        printf 'Error: REGION must be a two-letter country code, got: %s\n' "$REGION" >&2
+        exit 64
+    fi
+    REGION=$(printf '%s' "$REGION" | tr '[:upper:]' '[:lower:]')
+
+    case "$PROXY_CHECK" in
+        warn|strict|off) ;;
+        *)
+            printf 'Error: PROXY_CHECK must be warn, strict, or off.\n' >&2
+            exit 64
+            ;;
+    esac
+
+    if [ -n "$PROXY_SERVER" ] && [[ ! "$PROXY_SERVER" =~ ^(http|https|socks4|socks5)://[^[:space:]]+$ ]]; then
+        printf 'Error: unsupported PROXY_SERVER value: %s\n' "$PROXY_SERVER" >&2
+        exit 64
+    fi
+}
+
+chrome_is_running() {
+    /usr/bin/pgrep -x "$CHROME_PROCESS" >/dev/null 2>&1
+}
+
+proxy_endpoint() {
+    local endpoint host port
+    endpoint="${PROXY_SERVER#*://}"
+    endpoint="${endpoint%%/*}"
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
+
+    if [ "$host" = "$endpoint" ] || [ -z "$host" ] || [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n%s\n' "$host" "$port"
+}
+
+check_proxy() {
+    PROXY_STATUS="ok"
+    if [ -z "$PROXY_SERVER" ] || [ "$PROXY_CHECK" = "off" ]; then
+        PROXY_STATUS="skipped"
+        return 0
+    fi
+
+    local endpoint host port
+    endpoint=$(proxy_endpoint) || {
+        PROXY_STATUS="warning"
+        printf 'Warning: cannot parse proxy endpoint: %s\n' "$PROXY_SERVER" >&2
+        [ "$PROXY_CHECK" != "strict" ]
+        return
+    }
+    host=$(printf '%s\n' "$endpoint" | sed -n '1p')
+    port=$(printf '%s\n' "$endpoint" | sed -n '2p')
+
+    case "$host" in
+        127.0.0.1|localhost|::1)
+            if ! /usr/bin/nc -z "$host" "$port" >/dev/null 2>&1; then
+                PROXY_STATUS="warning"
+                printf 'Warning: local proxy is not listening at %s:%s.\n' "$host" "$port" >&2
+                if [ "$PROXY_CHECK" = "strict" ]; then
+                    printf 'Start the proxy or set PROXY_CHECK=warn/off.\n' >&2
+                    return 1
+                fi
+            fi
+            ;;
+    esac
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+print_launch_command() {
+    printf '/usr/bin/open '
+    shell_quote "$CHROME_APP"
+    printf ' --args '
+    shell_quote "--variations-override-country=$REGION"
+    if [ -n "$PROXY_SERVER" ]; then
+        printf ' '
+        shell_quote "--proxy-server=$PROXY_SERVER"
+    fi
+    printf '\n'
+}
+
+start_chrome() {
+    local dry_run="false"
+    if [ "$#" -gt 1 ]; then
+        printf 'Error: start accepts only --dry-run.\n' >&2
+        exit 64
+    fi
+    if [ "${1:-}" = "--dry-run" ]; then
+        dry_run="true"
+    elif [ -n "${1:-}" ]; then
+        printf 'Error: unknown start option: %s\n' "$1" >&2
+        exit 64
+    fi
+
+    if [ ! -d "$CHROME_APP" ]; then
+        printf 'Error: Chrome app not found: %s\n' "$CHROME_APP" >&2
+        printf 'Set CHROME_APP in %s.\n' "$CONFIG_FILE" >&2
+        exit 66
+    fi
+
+    if chrome_is_running; then
+        printf 'Chrome is already running. Quit it completely with Cmd+Q, then try again.\n' >&2
+        exit 2
+    fi
+
+    check_proxy
+
+    if [ "$dry_run" = "true" ] || [ "${CHROME_GEMINI_DRY_RUN:-0}" = "1" ]; then
+        print_launch_command
+        return 0
+    fi
+
+    local args
+    args=("--variations-override-country=$REGION")
+    if [ -n "$PROXY_SERVER" ]; then
+        args+=("--proxy-server=$PROXY_SERVER")
+    fi
+
+    /usr/bin/open "$CHROME_APP" --args "${args[@]}"
+    printf 'Chrome started with region=%s' "$REGION"
+    if [ -n "$PROXY_SERVER" ]; then
+        printf ' and proxy=%s' "$PROXY_SERVER"
+    fi
+    printf '.\nVerify the flags at chrome://version.\n'
+}
+
+find_patcher() {
+    local candidate
+    for candidate in \
+        "${CHROME_GEMINI_LIBEXEC:-}" \
+        "$SCRIPT_DIR/../scripts/patch-local-state.js" \
+        "$SCRIPT_DIR/../share/chrome-gemini/patch-local-state.js" \
+        "$HOME/.local/share/chrome-gemini/patch-local-state.js"; do
+        [ -n "$candidate" ] || continue
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+inspect_state() {
+    if [ ! -f "$LOCAL_STATE" ]; then
+        printf 'Local State: not found (%s)\n' "$LOCAL_STATE"
+        return 1
+    fi
+
+    local patcher
+    patcher=$(find_patcher) || {
+        printf 'Local State: found, but the inspector is missing.\n'
+        return 1
+    }
+    /usr/bin/osascript -l JavaScript "$patcher" inspect "$LOCAL_STATE"
+}
+
+repair_state() {
+    if chrome_is_running; then
+        printf 'Chrome is running. Quit it completely with Cmd+Q before repair.\n' >&2
+        exit 2
+    fi
+    if [ ! -f "$LOCAL_STATE" ]; then
+        printf 'Error: Chrome Local State not found: %s\n' "$LOCAL_STATE" >&2
+        exit 66
+    fi
+
+    local patcher timestamp backup mode
+    patcher=$(find_patcher) || {
+        printf 'Error: patch-local-state.js was not found. Reinstall the project.\n' >&2
+        exit 66
+    }
+
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup="${LOCAL_STATE}.chrome-gemini.backup.${timestamp}"
+    mode=$(stat -f '%Lp' "$LOCAL_STATE")
+    cp -p "$LOCAL_STATE" "$backup"
+
+    if ! /usr/bin/osascript -l JavaScript "$patcher" repair "$LOCAL_STATE" "$REGION"; then
+        printf 'Repair failed. Original backup: %s\n' "$backup" >&2
+        exit 1
+    fi
+    chmod "$mode" "$LOCAL_STATE"
+    printf 'Backup: %s\n' "$backup"
+    printf 'Repair complete. Start Chrome with: %s start\n' "$PROGRAM_NAME"
+}
+
+configure_project() {
+    local changed="false"
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --proxy-server)
+                if [ "$#" -lt 2 ]; then
+                    printf 'Error: --proxy-server requires a URL.\n' >&2
+                    exit 64
+                fi
+                PROXY_SERVER="$2"
+                changed="true"
+                shift 2
+                ;;
+            --system-proxy|--no-explicit-proxy)
+                PROXY_SERVER=""
+                changed="true"
+                shift
+                ;;
+            --region)
+                if [ "$#" -lt 2 ]; then
+                    printf 'Error: --region requires a two-letter country code.\n' >&2
+                    exit 64
+                fi
+                REGION="$2"
+                changed="true"
+                shift 2
+                ;;
+            --proxy-check)
+                if [ "$#" -lt 2 ]; then
+                    printf 'Error: --proxy-check requires warn, strict, or off.\n' >&2
+                    exit 64
+                fi
+                PROXY_CHECK="$2"
+                changed="true"
+                shift 2
+                ;;
+            --help|-h)
+                cat <<'EOF'
+Usage:
+  chrome-gemini configure --proxy-server URL
+  chrome-gemini configure --system-proxy
+  chrome-gemini configure [--region CC] [--proxy-check warn|strict|off]
+
+Examples:
+  chrome-gemini configure --proxy-server http://127.0.0.1:7897
+  chrome-gemini configure --proxy-server socks5://127.0.0.1:1080
+  chrome-gemini configure --system-proxy
+EOF
+                return 0
+                ;;
+            *)
+                printf 'Error: unknown configure option: %s\n' "$1" >&2
+                exit 64
+                ;;
+        esac
+    done
+
+    if [ "$changed" != "true" ]; then
+        printf 'No settings supplied. Use: %s configure --help\n' "$PROGRAM_NAME" >&2
+        exit 64
+    fi
+
+    validate_config
+
+    local config_dir temp_config timestamp backup
+    config_dir=$(dirname "$CONFIG_FILE")
+    mkdir -p "$config_dir"
+    umask 077
+
+    if [ -f "$CONFIG_FILE" ] && [ "${CHROME_GEMINI_SKIP_CONFIG_BACKUP:-0}" != "1" ]; then
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        backup="${CONFIG_FILE}.backup.${timestamp}"
+        cp -p "$CONFIG_FILE" "$backup"
+        printf 'Previous config backed up: %s\n' "$backup"
+    fi
+
+    temp_config=$(mktemp "$config_dir/config.XXXXXX")
+    {
+        printf '# Chrome Gemini Launcher configuration\n'
+        printf 'REGION=%s\n' "$REGION"
+        printf 'PROXY_SERVER=%s\n' "$PROXY_SERVER"
+        printf 'PROXY_CHECK=%s\n' "$PROXY_CHECK"
+        printf 'CHROME_APP=%s\n' "$CHROME_APP"
+        printf 'CHROME_PROCESS=%s\n' "$CHROME_PROCESS"
+    } > "$temp_config"
+    chmod 600 "$temp_config"
+    mv "$temp_config" "$CONFIG_FILE"
+
+    printf 'Configuration updated: %s\n' "$CONFIG_FILE"
+    printf 'Region: %s\n' "$REGION"
+    if [ -n "$PROXY_SERVER" ]; then
+        printf 'Explicit proxy: %s\n' "$PROXY_SERVER"
+    else
+        printf 'Explicit proxy: disabled; Chrome will use the macOS system proxy.\n'
+    fi
+}
+
+doctor() {
+    local failures=0
+    printf 'Chrome Gemini Launcher %s\n\n' "$VERSION"
+
+    if [ "$(uname -s)" = "Darwin" ]; then
+        printf '[OK] macOS detected\n'
+    else
+        printf '[FAIL] this project supports macOS only\n'
+        failures=$((failures + 1))
+    fi
+
+    if [ -d "$CHROME_APP" ]; then
+        printf '[OK] Chrome: %s\n' "$CHROME_APP"
+    else
+        printf '[FAIL] Chrome not found: %s\n' "$CHROME_APP"
+        failures=$((failures + 1))
+    fi
+
+    if chrome_is_running; then
+        printf '[WARN] Chrome is currently running\n'
+    else
+        printf '[OK] Chrome is stopped\n'
+    fi
+
+    if [ -f "$CONFIG_FILE" ]; then
+        printf '[OK] Config: %s\n' "$CONFIG_FILE"
+    else
+        printf '[INFO] Using built-in defaults; config not found: %s\n' "$CONFIG_FILE"
+    fi
+
+    if [ -z "$PROXY_SERVER" ]; then
+        printf '[INFO] Explicit proxy disabled\n'
+    elif check_proxy; then
+        if [ "$PROXY_STATUS" = "warning" ]; then
+            printf '[WARN] Proxy setting could not be verified: %s\n' "$PROXY_SERVER"
+        else
+            printf '[OK] Proxy setting: %s\n' "$PROXY_SERVER"
+        fi
+    else
+        printf '[FAIL] Proxy check failed: %s\n' "$PROXY_SERVER"
+        failures=$((failures + 1))
+    fi
+
+    printf '\nCurrent Local State summary:\n'
+    if ! inspect_state; then
+        failures=$((failures + 1))
+    fi
+
+    printf '\nLaunch command:\n'
+    print_launch_command
+
+    return "$failures"
+}
+
+print_help() {
+    cat <<'EOF'
+Chrome Gemini Launcher for macOS
+
+Usage:
+  chrome-gemini start [--dry-run]  Start Chrome with configured flags
+  chrome-gemini doctor             Check Chrome, proxy, and Local State
+  chrome-gemini repair             Back up and patch Local State explicitly
+  chrome-gemini inspect            Print relevant Local State fields
+  chrome-gemini configure OPTIONS  Set region and proxy without editing files
+  chrome-gemini config             Print the config file path
+  chrome-gemini version            Print the version
+  chrome-gemini help               Show this help
+
+The normal launcher never edits Google Chrome.app or Chrome configuration.
+The optional repair command modifies Local State only after making a backup.
+EOF
+}
+
+main() {
+    load_config
+
+    if [ "${1:-}" = "configure" ]; then
+        shift
+        configure_project "$@"
+        return
+    fi
+
+    validate_config
+
+    case "${1:-start}" in
+        start) shift || true; start_chrome "$@" ;;
+        doctor) doctor ;;
+        repair) repair_state ;;
+        inspect) inspect_state ;;
+        config) printf '%s\n' "$CONFIG_FILE" ;;
+        version|--version|-V) printf '%s %s\n' "$PROGRAM_NAME" "$VERSION" ;;
+        help|--help|-h) print_help ;;
+        *)
+            printf 'Unknown command: %s\n\n' "$1" >&2
+            print_help >&2
+            exit 64
+            ;;
+    esac
+}
+
+main "$@"
